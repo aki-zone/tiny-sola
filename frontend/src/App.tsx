@@ -79,6 +79,7 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [lastReplyText, setLastReplyText] = useState('')
+  const [lastTranscription, setLastTranscription] = useState('')
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
 
   useEffect(() => {
@@ -178,6 +179,7 @@ export default function App() {
       pushLog(`LLM: ${replyText || '(\u7a7a)'}`)
       pushLog(`ASR: ${transcription || '(\u7a7a)'}`)
       setLastReplyText(replyText)
+      setLastTranscription(transcription)
 
       if (audioBase64) {
         const audio = new Audio(`data:audio/wav;base64,${audioBase64}`)
@@ -214,12 +216,17 @@ export default function App() {
     setCopyState('idle')
   }
 
+  function handleClearTranscription() {
+    setLastTranscription('')
+  }
+
   function handleClearLogs() {
     setLogs([])
   }
 
   const statusInfo = STATUS_MAP[status]
   const canCopy = Boolean(lastReplyText)
+  const hasTranscription = Boolean(lastTranscription)
   const copyLabelMap = {
     idle: '\u590d\u5236',
     copied: '\u5df2\u590d\u5236',
@@ -291,6 +298,30 @@ export default function App() {
             </div>
           </section>
 
+          <section className="card card--aside">
+            <div className="card__header">
+              <div className="card__title-group">
+                <h2 className="card__title">\u6700\u65b0\u8bc6\u522b\u6587\u672c</h2>
+                <p className="card__subtitle">\u6765\u81ea\u6b63\u524d\u4e00\u6b21\u8bed\u97f3\u8bc6\u522b\u7684\u7ed3\u679c\u3002</p>
+              </div>
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={handleClearTranscription}
+                disabled={!hasTranscription}
+              >
+                \u6e05\u7a7a
+              </button>
+            </div>
+            <div className="text-box transcript-box" role="status" aria-live="polite">
+              {hasTranscription ? (
+                <p className="text-box__content">{lastTranscription}</p>
+              ) : (
+                <p className="text-box__placeholder">\u7b49\u5f85\u8bed\u97f3\u8bc6\u522b\u4ea7\u751f\u7b2c\u4e00\u6761\u5185\u5bb9\u3002</p>
+              )}
+            </div>
+          </section>
+
           <section className="card">
             <div className="card__header">
               <div className="card__title-group">
@@ -316,11 +347,11 @@ export default function App() {
                 </button>
               </div>
             </div>
-            <div className="reply-box" role="status" aria-live="polite">
+            <div className="text-box reply-box" role="status" aria-live="polite">
               {lastReplyText ? (
-                <p className="reply-box__content">{lastReplyText}</p>
+                <p className="text-box__content">{lastReplyText}</p>
               ) : (
-                <p className="reply-box__placeholder">\u7b49\u5f85\u540e\u7aef\u8fd4\u56de\u7b2c\u4e00\u6761\u5185\u5bb9\u3002</p>
+                <p className="text-box__placeholder">\u7b49\u5f85\u540e\u7aef\u8fd4\u56de\u7b2c\u4e00\u6761\u5185\u5bb9\u3002</p>
               )}
             </div>
           </section>

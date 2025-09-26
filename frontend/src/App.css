@@ -158,6 +158,14 @@ body {
   pointer-events: none;
 }
 
+.card--wide {
+  grid-column: 1 / -1;
+}
+
+.card--aside {
+  grid-column: 2;
+}
+
 .card__header {
   position: relative;
   display: flex;
@@ -190,10 +198,6 @@ body {
   display: inline-flex;
   gap: 8px;
   flex-wrap: wrap;
-}
-
-.card--wide {
-  grid-column: 1 / -1;
 }
 
 .status-chip {
@@ -388,7 +392,7 @@ body {
   background: rgba(249, 115, 22, 0.15);
 }
 
-.reply-box {
+.text-box {
   padding: 20px 24px;
   border-radius: 18px;
   border: 1px solid rgba(148, 163, 184, 0.25);
@@ -398,16 +402,25 @@ body {
   align-items: center;
 }
 
-.reply-box__content {
+.text-box__content {
   margin: 0;
   line-height: 1.6;
   font-size: 1.02rem;
   color: #0f172a;
 }
 
-.reply-box__placeholder {
+.text-box__placeholder {
   margin: 0;
   color: #9aa8bf;
+}
+
+.transcript-box {
+  background: rgba(236, 252, 203, 0.65);
+  border-color: rgba(134, 239, 172, 0.35);
+}
+
+.reply-box {
+  background: rgba(248, 250, 252, 0.8);
 }
 
 .card--logs {
@@ -551,6 +564,10 @@ body {
 
   .card--logs {
     max-height: none;
+  }
+
+  .card--aside {
+    grid-column: auto;
   }
 
   .log-list {
