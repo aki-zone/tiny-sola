@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
@@ -10,6 +10,45 @@ const timeFormatter = new Intl.DateTimeFormat('zh-CN', {
   minute: '2-digit',
   second: '2-digit',
 })
+const healthTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+})
+
+type HealthDetails = {
+  ffmpeg: {
+    available: boolean
+    path: string | null
+  }
+  piper: {
+    binary_available: boolean
+    binary_path: string | null
+    model_available: boolean
+    model_path: string
+  }
+  ollama: {
+    available: boolean
+    host: string
+    model: string
+    error: string | null
+  }
+}
+
+type HealthResponse = {
+  status: 'ok' | 'degraded'
+  timestamp: string
+  details: HealthDetails
+}
+
+type HealthState = {
+  phase: 'loading' | 'ready' | 'error'
+  data: HealthResponse | null
+  error: string | null
+}
+
 
 type Status = 'idle' | 'recording' | 'uploading' | 'reply_ready' | 'error'
 
@@ -82,6 +121,39 @@ export default function App() {
   const [lastTranscription, setLastTranscription] = useState('')
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
 
+  const [health, setHealth] = useState<HealthState>({
+    phase: 'loading',
+    data: null,
+    error: null,
+  })
+  const [healthRefreshing, setHealthRefreshing] = useState(false)
+
+  const loadHealth = useCallback(async () => {
+    setHealth((prev) => ({
+      phase: prev.data ? 'ready' : 'loading',
+      data: prev.data,
+      error: null,
+    }))
+    setHealthRefreshing(true)
+    try {
+      const response = await fetch(`${API_BASE}/health`)
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`)
+      }
+      const data: HealthResponse = await response.json()
+      setHealth({ phase: 'ready', data, error: null })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '\u672a\u77e5\u9519\u8bef'
+      setHealth((prev) => ({
+        phase: prev.data ? 'ready' : 'error',
+        data: prev.data,
+        error: message,
+      }))
+    } finally {
+      setHealthRefreshing(false)
+    }
+  }, [])
+
   useEffect(() => {
     return () => {
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
@@ -89,6 +161,10 @@ export default function App() {
       }
     }
   }, [])
+
+  useEffect(() => {
+    loadHealth()
+  }, [loadHealth])
 
   useEffect(() => {
     if (copyState === 'idle') {
@@ -103,6 +179,40 @@ export default function App() {
       setCopyState('idle')
     }
   }, [lastReplyText])
+
+  useEffect(() => {
+    function handleGlobalShortcut(event: KeyboardEvent) {
+      if (event.repeat || event.altKey || event.ctrlKey || event.metaKey) {
+        return
+      }
+      const target = event.target as HTMLElement | null
+      if (target) {
+        const tagName = target.tagName
+        const isEditable = target.isContentEditable || tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT'
+        if (isEditable) {
+          return
+        }
+        if (target.closest && target.closest('button,[role="button"]')) {
+          return
+        }
+      }
+
+      if (event.code === 'Space' || event.key === ' ') {
+        if (status === 'uploading') {
+          return
+        }
+        event.preventDefault()
+        if (isRecording) {
+          stopRecording()
+        } else {
+          startRecording()
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handleGlobalShortcut)
+    return () => window.removeEventListener('keydown', handleGlobalShortcut)
+  }, [isRecording, status])
 
   function pushLog(text: string, tone: LogTone = 'info') {
     const entry: LogEntry = {
@@ -247,6 +357,68 @@ export default function App() {
     .filter(Boolean)
     .join(' ')
   const recordButtonDisabled = !isRecording && status === 'uploading'
+  const healthData = health.data
+  const isHealthLoading = health.phase === 'loading' && !healthData
+  const isHealthRefreshing = healthRefreshing || health.phase === 'loading'
+  const healthTone =
+    health.phase === 'error'
+      ? 'error'
+      : healthData?.status === 'degraded'
+        ? 'warn'
+        : 'ok'
+  const healthLabel =
+    health.phase === 'error'
+      ? '\u65e0\u6cd5\u8fde\u63a5\u540e\u7aef'
+      : healthData?.status === 'degraded'
+        ? '\u540e\u7aef\u4f9d\u8d56\u9700\u5173\u6ce8'
+        : healthData?.status === 'ok'
+          ? '\u540e\u7aef\u8fd0\u884c\u6b63\u5e38'
+          : '\u6b63\u5728\u68c0\u6d4b\u540e\u7aef\u72b6\u6001'
+  const healthTimestamp = (() => {
+    if (!healthData) {
+      return null
+    }
+    const parsed = new Date(healthData.timestamp)
+    if (Number.isNaN(parsed.getTime())) {
+      return null
+    }
+    return healthTimeFormatter.format(parsed)
+  })()
+  const healthDetailItems = healthData
+    ? [
+        {
+          key: 'ffmpeg',
+          label: 'ffmpeg',
+          ok: healthData.details.ffmpeg.available,
+          text: healthData.details.ffmpeg.available ? '\u53ef\u7528' : '\u7f3a\u5931',
+        },
+        {
+          key: 'piper',
+          label: 'Piper',
+          ok:
+            healthData.details.piper.binary_available &&
+            healthData.details.piper.model_available,
+          text: healthData.details.piper.binary_available
+            ? healthData.details.piper.model_available
+              ? '\u8bed\u97f3\u5408\u6210\u5c31\u7eea'
+              : '\u7f3a\u5c11\u6a21\u578b\u6587\u4ef6'
+            : '\u7f3a\u5c11\u6267\u884c\u6587\u4ef6',
+        },
+        {
+          key: 'ollama',
+          label: 'Ollama',
+          ok: healthData.details.ollama.available,
+          text: healthData.details.ollama.available
+            ? `\u6a21\u578b ${healthData.details.ollama.model}`
+            : '\u672a\u8fde\u63a5',
+        },
+      ]
+    : []
+  const healthError = health.error
+  const refreshButtonLabel = isHealthRefreshing ? '\u68c0\u6d4b\u4e2d...' : '\u91cd\u65b0\u68c0\u6d4b'
+  const healthPlaceholder = isHealthLoading ? '\u6b63\u5728\u68c0\u6d4b...' : healthError ? '\u5065\u5eb7\u68c0\u67e5\u5931\u8d25, \u8bf7\u7a0d\u540e\u91cd\u8bd5' : '\u7b49\u5f85\u5065\u5eb7\u4fe1\u606f'
+
+
 
   return (
     <div className="app">
@@ -255,6 +427,42 @@ export default function App() {
           <span className="app__badge">MVP</span>
           <h1 className="app__title">tiny-sola \u5bf9\u8bdd\u9762\u677f</h1>
           <p className="app__subtitle">{statusInfo.hint}</p>
+          <div className="health-banner" role="status" aria-live="polite">
+            <div className="health-banner__summary">
+              <span className={`health-banner__pill health-banner__pill--${healthTone}`}>
+                {healthLabel}
+              </span>
+              {healthTimestamp && (
+                <span className="health-banner__timestamp">\u6700\u8fd1\u68c0\u6d4b {healthTimestamp}</span>
+              )}
+              {healthError && (
+                <span className="health-banner__error">{healthError}</span>
+              )}
+            </div>
+            <div className="health-banner__details">
+              {healthDetailItems.length ? (
+                healthDetailItems.map((item) => (
+                  <div
+                    key={item.key}
+                    className={`health-banner__detail ${item.ok ? 'is-ok' : 'is-warn'}`}
+                  >
+                    <span className="health-banner__detail-label">{item.label}</span>
+                    <span className="health-banner__detail-value">{item.text}</span>
+                  </div>
+                ))
+              ) : (
+                <span className="health-banner__placeholder">{healthPlaceholder}</span>
+              )}
+            </div>
+            <button
+              type="button"
+              className="ghost-btn ghost-btn--compact"
+              onClick={loadHealth}
+              disabled={isHealthRefreshing}
+            >
+              {refreshButtonLabel}
+            </button>
+          </div>
           <ol className="workflow" aria-label="workflow">
             {WORKFLOW_STEPS.map((step, index) => (
               <li className="workflow__item" key={step}>
@@ -264,6 +472,7 @@ export default function App() {
             ))}
           </ol>
         </header>
+
 
         <main className="app__main">
           <section className="card card--primary">
@@ -290,10 +499,10 @@ export default function App() {
               </button>
               <p className="recorder__hint">
                 {isRecording
-                  ? '\u5f55\u97f3\u8fdb\u884c\u4e2d, \u70b9\u51fb\u6309\u94ae\u7ed3\u675f\u5e76\u81ea\u52a8\u89e3\u6790\u3002'
+                  ? '\u5f55\u97f3\u8fdb\u884c\u4e2d, \u70b9\u51fb\u6309\u94ae\u7ed3\u675f\u5e76\u81ea\u52a8\u89e3\u6790\u3002\u53ef\u4ee5\u6309\u4e0b\u7a7a\u683c\u952e\u5feb\u901f\u7ed3\u675f.'
                   : status === 'uploading'
                     ? '\u6b63\u5728\u4e0a\u4f20\u5e76\u8fdb\u884c\u8bed\u97f3\u8bc6\u522b, \u8bf7\u7a0d\u5019\u3002'
-                    : '\u70b9\u51fb\u6309\u94ae\u6388\u6743\u9ea6\u514b\u98ce\u5e76\u5f00\u59cb\u5f55\u97f3\u3002'}
+                    : '\u70b9\u51fb\u6309\u94ae\u6388\u6743\u9ea6\u514b\u98ce\u5e76\u5f00\u59cb\u5f55\u97f3, \u6216\u6309\u7a7a\u683c\u952e\u5feb\u901f\u5f00\u59cb.'}
               </p>
             </div>
           </section>

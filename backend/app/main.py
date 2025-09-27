@@ -7,7 +7,9 @@ import tempfile
 import base64
 import subprocess
 import os
+import shutil
 from typing import Optional
+from datetime import datetime
 
 from .config import settings
 
@@ -116,6 +118,56 @@ async def speak(req: SpeakRequest):
         except Exception:
             pass
 
+
+
+@app.get("/health")
+async def health():
+    ffmpeg_path = shutil.which("ffmpeg")
+    if os.path.isabs(settings.PIPER_BIN):
+        piper_path = settings.PIPER_BIN if os.path.exists(settings.PIPER_BIN) else None
+    else:
+        piper_path = shutil.which(settings.PIPER_BIN)
+    piper_model_available = os.path.exists(settings.PIPER_MODEL)
+
+    ollama_available = False
+    ollama_error: Optional[str] = None
+    try:
+        import requests
+
+        resp = requests.get(f"{settings.OLLAMA_HOST}/api/tags", timeout=3)
+        resp.raise_for_status()
+        ollama_available = True
+    except Exception as exc:  # noqa: BLE001 - surface error message to caller
+        ollama_error = str(exc)
+
+    has_all = all([
+        bool(ffmpeg_path),
+        bool(piper_path),
+        piper_model_available,
+        ollama_available,
+    ])
+
+    status_value = "ok" if has_all else "degraded"
+
+    return {
+        "status": status_value,
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "details": {
+            "ffmpeg": {"available": bool(ffmpeg_path), "path": ffmpeg_path},
+            "piper": {
+                "binary_available": bool(piper_path),
+                "binary_path": piper_path,
+                "model_available": piper_model_available,
+                "model_path": settings.PIPER_MODEL,
+            },
+            "ollama": {
+                "available": ollama_available,
+                "host": settings.OLLAMA_HOST,
+                "model": settings.OLLAMA_MODEL,
+                "error": ollama_error,
+            },
+        },
+    }
 
 @app.post("/talk")
 async def talk(file: UploadFile = File(...)):
