@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
@@ -49,7 +49,6 @@ type HealthState = {
   error: string | null
 }
 
-
 type Status = 'idle' | 'recording' | 'uploading' | 'reply_ready' | 'error'
 
 type StatusVisual = {
@@ -67,40 +66,76 @@ type LogEntry = {
   timestamp: string
 }
 
+type ConversationMessage = {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+type RoleSkillInfo = {
+  id: string
+  name: string
+  description: string
+  requires_user_input: boolean
+  placeholder?: string | null
+}
+
+type RoleInfo = {
+  id: string
+  name: string
+  alias?: string | null
+  tagline?: string | null
+  summary?: string | null
+  background?: string | null
+  style?: string | null
+  knowledge_focus: string[]
+  sample_questions: string[]
+  skills: RoleSkillInfo[]
+}
+
+type SkillResult = {
+  id: string
+  roleId: string
+  roleName: string
+  skillId: string
+  skillName: string
+  text: string
+  timestamp: string
+}
+
 const STATUS_MAP: Record<Status, StatusVisual> = {
   idle: {
-    label: '\u51c6\u5907\u5c31\u7eea',
+    label: '准备就绪',
     tone: 'neutral',
-    hint: '\u70b9\u51fb\u6309\u94ae\u5f00\u59cb\u7b2c\u4e00\u6bb5\u5f55\u97f3\u3002',
+    hint: '点击按钮选择角色后开始录音对话。',
   },
   recording: {
-    label: '\u5f55\u97f3\u4e2d...',
+    label: '录音中...',
     tone: 'active',
-    hint: '\u5f55\u97f3\u8fdb\u884c\u4e2d\uff0c\u8bf7\u4fdd\u6301\u8ddd\u79bb\u548c\u8bed\u901f\u3002',
+    hint: '录音进行中，请保持距离和语速。',
   },
   uploading: {
-    label: '\u89e3\u6790\u4e2d...',
+    label: '解析中...',
     tone: 'loading',
-    hint: '\u540e\u7aef\u6b63\u5728\u89e3\u6790\u97f3\u9891\uff0c\u8bf7\u7b49\u5f85\u7247\u523b\u3002',
+    hint: '后端正在解析音频，请稍后。',
   },
   reply_ready: {
-    label: '\u56de\u590d\u5df2\u66f4\u65b0',
+    label: '回复已更新',
     tone: 'success',
-    hint: '\u4e0b\u65b9\u5df2\u5c55\u793a\u6700\u65b0\u56de\u590d\uff0c\u53ef\u590d\u5236\u6216\u7ee7\u7eed\u5f55\u97f3\u3002',
+    hint: '始终保持角色说话样式，可以接下来录音或使用技能。',
   },
   error: {
-    label: '\u5df2\u505c\u6b62, \u53d1\u751f\u9519\u8bef',
+    label: '已停止, 发生错误',
     tone: 'error',
-    hint: '\u8bf7\u6839\u636e\u63d0\u793a\u6392\u67e5\u95ee\u9898\u540e\u518d\u6b21\u5c1d\u8bd5\u3002',
+    hint: '请根据提示排查问题后再试。',
   },
 }
 
 const WORKFLOW_STEPS = [
-  '\u5f55\u97f3',
-  '\u8bed\u97f3\u8bc6\u522b',
-  '\u5927\u6a21\u578b\u56de\u590d',
-  '\u8bed\u97f3\u5408\u6210',
-  '\u64ad\u653e',
+  '选择角色',
+  '录音',
+  '语音识别',
+  '角色回复',
+  '语音合成',
 ]
 
 function createLogId(): string {
@@ -113,6 +148,8 @@ function createLogId(): string {
 export default function App() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
+  const conversationRef = useRef<ConversationMessage[]>([])
+
   const [isRecording, setIsRecording] = useState(false)
   const [status, setStatus] = useState<Status>('idle')
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
@@ -127,6 +164,30 @@ export default function App() {
     error: null,
   })
   const [healthRefreshing, setHealthRefreshing] = useState(false)
+
+  const [roles, setRoles] = useState<RoleInfo[]>([])
+  const [defaultRoleId, setDefaultRoleId] = useState<string | null>(null)
+  const [selectedRoleId, setSelectedRoleId] = useState<string | null>(null)
+  const [roleSearch, setRoleSearch] = useState('')
+  const [conversation, setConversation] = useState<ConversationMessage[]>([])
+  const [skillResults, setSkillResults] = useState<SkillResult[]>([])
+  const [skillInputs, setSkillInputs] = useState<Record<string, string>>({})
+  const [skillLoading, setSkillLoading] = useState<Record<string, boolean>>({})
+  const [skillError, setSkillError] = useState<string | null>(null)
+
+  const statusInfo = STATUS_MAP[status]
+  const isHealthLoading = health.phase === 'loading'
+  const isHealthRefreshing = healthRefreshing
+
+  const pushLog = useCallback((text: string, tone: LogTone = 'info') => {
+    const entry: LogEntry = {
+      id: createLogId(),
+      text,
+      tone,
+      timestamp: timeFormatter.format(new Date()),
+    }
+    setLogs((prev) => [entry, ...prev].slice(0, LOG_LIMIT))
+  }, [])
 
   const loadHealth = useCallback(async () => {
     setHealth((prev) => ({
@@ -143,16 +204,37 @@ export default function App() {
       const data: HealthResponse = await response.json()
       setHealth({ phase: 'ready', data, error: null })
     } catch (error) {
-      const message = error instanceof Error ? error.message : '\u672a\u77e5\u9519\u8bef'
+      const message = error instanceof Error ? error.message : '未知错误'
       setHealth((prev) => ({
         phase: prev.data ? 'ready' : 'error',
         data: prev.data,
         error: message,
       }))
+      pushLog(`健康检查失败: ${message}`, 'warn')
     } finally {
       setHealthRefreshing(false)
     }
-  }, [])
+  }, [pushLog])
+
+  const loadRoles = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/roles`)
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`)
+      }
+      const payload = await response.json()
+      const fetchedRoles: RoleInfo[] = payload.roles || []
+      setRoles(fetchedRoles)
+      const defaultId: string | null = payload.default_role_id || null
+      setDefaultRoleId(defaultId)
+      setSelectedRoleId((prev) => prev || defaultId || (fetchedRoles[0]?.id ?? null))
+      pushLog(`已加载 ${fetchedRoles.length} 位角色`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '未知错误'
+      setErrorMsg(`角色列表加载失败: ${message}`)
+      pushLog(`加载角色失败: ${message}`, 'error')
+    }
+  }, [pushLog])
 
   useEffect(() => {
     return () => {
@@ -164,7 +246,8 @@ export default function App() {
 
   useEffect(() => {
     loadHealth()
-  }, [loadHealth])
+    loadRoles()
+  }, [loadHealth, loadRoles])
 
   useEffect(() => {
     if (copyState === 'idle') {
@@ -179,6 +262,10 @@ export default function App() {
       setCopyState('idle')
     }
   }, [lastReplyText])
+
+  useEffect(() => {
+    conversationRef.current = conversation
+  }, [conversation])
 
   useEffect(() => {
     function handleGlobalShortcut(event: KeyboardEvent) {
@@ -197,11 +284,11 @@ export default function App() {
         }
       }
 
-      if (event.code === 'Space' || event.key === ' ') {
+      if ((event.code === 'Space' || event.key === ' ') && selectedRoleId) {
+        event.preventDefault()
         if (status === 'uploading') {
           return
         }
-        event.preventDefault()
         if (isRecording) {
           stopRecording()
         } else {
@@ -212,24 +299,89 @@ export default function App() {
 
     window.addEventListener('keydown', handleGlobalShortcut)
     return () => window.removeEventListener('keydown', handleGlobalShortcut)
-  }, [isRecording, status])
+  }, [isRecording, selectedRoleId, status])
 
-  function pushLog(text: string, tone: LogTone = 'info') {
-    const entry: LogEntry = {
-      id: createLogId(),
-      text,
-      tone,
-      timestamp: timeFormatter.format(new Date()),
+  const selectedRole = useMemo(() => roles.find((role) => role.id === selectedRoleId) || null, [roles, selectedRoleId])
+
+  const filteredRoles = useMemo(() => {
+    const term = roleSearch.trim().toLowerCase()
+    if (!term) {
+      return roles
     }
-    setLogs((prev) => [entry, ...prev].slice(0, LOG_LIMIT))
-  }
+    return roles.filter((role) => {
+      const haystack = [
+        role.name,
+        role.alias ?? '',
+        role.tagline ?? '',
+        role.summary ?? '',
+        role.background ?? '',
+        role.style ?? '',
+        (role.knowledge_focus || []).join(' '),
+      ]
+        .join(' ')
+        .toLowerCase()
+      return haystack.includes(term)
+    })
+  }, [roles, roleSearch])
+
+  const selectedRoleName = selectedRole?.name || '角色'
+  const selectedRoleSkills = selectedRole?.skills ?? []
+  const hasConversation = conversation.length > 0
+  const hasSkillResults = skillResults.length > 0
+  const canCopy = lastReplyText.length > 0
+  const recordButtonDisabled = status === 'uploading' || isHealthLoading || !selectedRoleId
+  const recordButtonLabel = isRecording ? '停止录音' : status === 'uploading' ? '解析中...' : '开始录音'
+  const recordButtonClass = `record-btn ${isRecording ? 'is-recording' : ''}`
+
+  const isHealthOk = health.data?.status === 'ok'
+  const healthTone = isHealthOk ? 'ok' : 'warn'
+  const healthLabel = isHealthOk ? '服务可用' : '部分功能待检'
+  const healthTimestamp = health.data ? healthTimeFormatter.format(new Date(health.data.timestamp)) : ''
+  const healthDetailItems = health.data
+    ? [
+        {
+          key: 'ffmpeg',
+          label: 'ffmpeg',
+          ok: health.data.details.ffmpeg.available,
+          text: health.data.details.ffmpeg.available ? '可用' : '未找到',
+        },
+        {
+          key: 'piper',
+          label: 'Piper',
+          ok: health.data.details.piper.binary_available && health.data.details.piper.model_available,
+          text: health.data.details.piper.binary_available
+            ? health.data.details.piper.model_available
+              ? '语音合成就绪'
+              : '缺少语音模型'
+            : '缺少执行程序',
+        },
+        {
+          key: 'ollama',
+          label: 'LLM',
+          ok: health.data.details.ollama.available,
+          text: health.data.details.ollama.available
+            ? `模型 ${health.data.details.ollama.model}`
+            : '未连接',
+        },
+      ]
+    : []
+  const healthError = health.error
+  const refreshButtonLabel = isHealthRefreshing ? '检测中...' : '重新检测'
+  const healthPlaceholder = isHealthLoading ? '正在检测...' : healthError ? '检查失败, 请稍后重试' : '等待健康数据'
 
   async function startRecording() {
     setErrorMsg(null)
+    if (!selectedRoleId) {
+      setStatus('error')
+      setErrorMsg('请先在左侧选择一位角色。')
+      pushLog('未选择角色, 无法开始录音', 'warn')
+      return
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       const recorder = new MediaRecorder(stream)
       audioChunksRef.current = []
+      const roleIdAtStart = selectedRoleId
 
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
@@ -241,7 +393,7 @@ export default function App() {
         setIsRecording(false)
         setStatus('uploading')
         const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
-        await sendToTalk(blob)
+        await sendToTalk(blob, roleIdAtStart)
         stream.getTracks().forEach((track) => track.stop())
         mediaRecorderRef.current = null
       }
@@ -250,11 +402,11 @@ export default function App() {
       mediaRecorderRef.current = recorder
       setIsRecording(true)
       setStatus('recording')
-      pushLog('\u5f00\u59cb\u5f55\u97f3')
+      pushLog(`录音开始 -> ${selectedRoleName}`)
     } catch (error) {
-      const message = error instanceof Error ? error.message : '\u65e0\u6cd5\u8bbf\u95ee\u9ea6\u514b\u98ce'
-      pushLog(`\u9ea6\u514b\u98ce\u8bbf\u95ee\u5931\u8d25: ${message}`, 'error')
-      setErrorMsg('\u8bf7\u68c0\u67e5\u6d4f\u89c8\u5668\u9ea6\u514b\u98ce\u6743\u9650\u8bbe\u7f6e\u540e\u91cd\u8bd5\u3002')
+      const message = error instanceof Error ? error.message : '无法访问麦克风'
+      pushLog(`麦克风访问失败: ${message}`, 'error')
+      setErrorMsg('请检查浏览器麦克风权限后重试。')
       setStatus('error')
     }
   }
@@ -262,14 +414,23 @@ export default function App() {
   function stopRecording() {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop()
-      pushLog('\u5df2\u505c\u6b62\u5f55\u97f3, \u51c6\u5907\u4e0a\u4f20...')
+      pushLog('已停止录音, 准备上传...')
     }
   }
 
-  async function sendToTalk(blob: Blob) {
-    pushLog('\u4e0a\u4f20\u97f3\u9891\u4e2d...')
+  async function sendToTalk(blob: Blob, roleId: string | null) {
+    if (!roleId) {
+      setStatus('error')
+      setErrorMsg('未找到选中的角色。')
+      pushLog('未找到选中角色, /talk 被中止', 'error')
+      return
+    }
+
+    pushLog('上传音频中...')
     const form = new FormData()
     form.append('file', blob, 'audio.webm')
+    form.append('role_id', roleId)
+    form.append('history', JSON.stringify(conversationRef.current.slice(-8)))
 
     try {
       const response = await fetch(`${API_BASE}/talk`, {
@@ -278,32 +439,39 @@ export default function App() {
       })
 
       if (!response.ok) {
-        throw new Error(`\u63a5\u53e3\u8fd4\u56de ${response.status}`)
+        throw new Error(`接口返回 ${response.status}`)
       }
 
       const data = await response.json()
       const transcription: string = data.transcription || ''
       const replyText: string = data.reply_text || ''
       const audioBase64: string | undefined = data.reply_audio_base64
+      const role = roles.find((item) => item.id === roleId)
+      const roleLabel = role?.name || '角色'
 
-      pushLog(`LLM: ${replyText || '(\u7a7a)'}`)
-      pushLog(`ASR: ${transcription || '(\u7a7a)'}`)
+      pushLog(`ASR: ${transcription || '(无文本)'}`)
+      pushLog(`${roleLabel}: ${replyText || '(无回复)'}`)
       setLastReplyText(replyText)
       setLastTranscription(transcription)
+      setConversation((prev) => {
+        const next = [...prev, { role: 'user', content: transcription }, { role: 'assistant', content: replyText }]
+        conversationRef.current = next
+        return next
+      })
 
       if (audioBase64) {
         const audio = new Audio(`data:audio/wav;base64,${audioBase64}`)
         audio.play().catch(() => {
-          pushLog('\u97f3\u9891\u64ad\u653e\u5931\u8d25(\u53ef\u80fd\u88ab\u6d4f\u89c8\u5668\u62e6\u622a)', 'warn')
+          pushLog('音频播放失败(可能被浏览器拦截)', 'warn')
         })
       }
 
       setStatus('reply_ready')
     } catch (error) {
-      const message = error instanceof Error ? error.message : '\u672a\u77e5\u9519\u8bef'
+      const message = error instanceof Error ? error.message : '未知错误'
       setStatus('error')
-      setErrorMsg(`\u8c03\u7528\u63a5\u53e3\u5931\u8d25: ${message}`)
-      pushLog('\u8c03\u7528 /talk \u5931\u8d25', 'error')
+      setErrorMsg(`调用失败: ${message}`)
+      pushLog('调用 /talk 失败', 'error')
     }
   }
 
@@ -314,126 +482,124 @@ export default function App() {
     try {
       await navigator.clipboard.writeText(lastReplyText)
       setCopyState('copied')
-      pushLog('\u5df2\u590d\u5236\u6700\u65b0\u56de\u590d')
+      pushLog('已复制最新回复')
     } catch (_error) {
       setCopyState('failed')
-      pushLog('\u590d\u5236\u56de\u590d\u65f6\u9047\u5230\u95ee\u9898', 'warn')
+      pushLog('复制回复时遇到问题', 'warn')
     }
   }
 
-  function handleClearReply() {
+  function handleResetConversation() {
+    setConversation([])
+    conversationRef.current = []
     setLastReplyText('')
-    setCopyState('idle')
-  }
-
-  function handleClearTranscription() {
     setLastTranscription('')
+    pushLog('已清空本次对话')
   }
 
   function handleClearLogs() {
     setLogs([])
   }
 
-  const statusInfo = STATUS_MAP[status]
-  const canCopy = Boolean(lastReplyText)
-  const hasTranscription = Boolean(lastTranscription)
-  const copyLabelMap = {
-    idle: '\u590d\u5236',
-    copied: '\u5df2\u590d\u5236',
-    failed: '\u91cd\u8bd5\u590d\u5236',
+  function handleRoleSearchChange(event: React.ChangeEvent<HTMLInputElement>) {
+    setRoleSearch(event.target.value)
   }
-  const copyLabel = copyLabelMap[copyState]
-  const recordButtonLabel = isRecording
-    ? '\u505c\u6b62\u5f55\u97f3'
-    : status === 'uploading'
-      ? '\u5904\u7406\u4e2d...'
-      : '\u5f00\u59cb\u5f55\u97f3'
-  const recordButtonClass = [
-    'record-btn',
-    isRecording ? 'record-btn--stop' : '',
-    isRecording ? 'record-btn--live' : '',
-    !isRecording && status === 'uploading' ? 'record-btn--waiting' : '',
-  ]
-    .filter(Boolean)
-    .join(' ')
-  const recordButtonDisabled = !isRecording && status === 'uploading'
-  const healthData = health.data
-  const isHealthLoading = health.phase === 'loading' && !healthData
-  const isHealthRefreshing = healthRefreshing || health.phase === 'loading'
-  const healthTone =
-    health.phase === 'error'
-      ? 'error'
-      : healthData?.status === 'degraded'
-        ? 'warn'
-        : 'ok'
-  const healthLabel =
-    health.phase === 'error'
-      ? '\u65e0\u6cd5\u8fde\u63a5\u540e\u7aef'
-      : healthData?.status === 'degraded'
-        ? '\u540e\u7aef\u4f9d\u8d56\u9700\u5173\u6ce8'
-        : healthData?.status === 'ok'
-          ? '\u540e\u7aef\u8fd0\u884c\u6b63\u5e38'
-          : '\u6b63\u5728\u68c0\u6d4b\u540e\u7aef\u72b6\u6001'
-  const healthTimestamp = (() => {
-    if (!healthData) {
-      return null
-    }
-    const parsed = new Date(healthData.timestamp)
-    if (Number.isNaN(parsed.getTime())) {
-      return null
-    }
-    return healthTimeFormatter.format(parsed)
-  })()
-  const healthDetailItems = healthData
-    ? [
-        {
-          key: 'ffmpeg',
-          label: 'ffmpeg',
-          ok: healthData.details.ffmpeg.available,
-          text: healthData.details.ffmpeg.available ? '\u53ef\u7528' : '\u7f3a\u5931',
-        },
-        {
-          key: 'piper',
-          label: 'Piper',
-          ok:
-            healthData.details.piper.binary_available &&
-            healthData.details.piper.model_available,
-          text: healthData.details.piper.binary_available
-            ? healthData.details.piper.model_available
-              ? '\u8bed\u97f3\u5408\u6210\u5c31\u7eea'
-              : '\u7f3a\u5c11\u6a21\u578b\u6587\u4ef6'
-            : '\u7f3a\u5c11\u6267\u884c\u6587\u4ef6',
-        },
-        {
-          key: 'ollama',
-          label: 'Ollama',
-          ok: healthData.details.ollama.available,
-          text: healthData.details.ollama.available
-            ? `\u6a21\u578b ${healthData.details.ollama.model}`
-            : '\u672a\u8fde\u63a5',
-        },
-      ]
-    : []
-  const healthError = health.error
-  const refreshButtonLabel = isHealthRefreshing ? '\u68c0\u6d4b\u4e2d...' : '\u91cd\u65b0\u68c0\u6d4b'
-  const healthPlaceholder = isHealthLoading ? '\u6b63\u5728\u68c0\u6d4b...' : healthError ? '\u5065\u5eb7\u68c0\u67e5\u5931\u8d25, \u8bf7\u7a0d\u540e\u91cd\u8bd5' : '\u7b49\u5f85\u5065\u5eb7\u4fe1\u606f'
 
+  function handleSelectRole(roleId: string) {
+    if (roleId === selectedRoleId) {
+      return
+    }
+    const role = roles.find((item) => item.id === roleId)
+    setSelectedRoleId(roleId)
+    setSkillInputs({})
+    setSkillResults([])
+    setSkillError(null)
+    handleResetConversation()
+    setStatus('idle')
+    if (role) {
+      pushLog(`已切换到 ${role.name}`)
+    }
+  }
 
+  function handleSkillInputChange(skillId: string, value: string) {
+    setSkillInputs((prev) => ({ ...prev, [skillId]: value }))
+  }
+
+  function handleClearSkillResults() {
+    setSkillResults([])
+    pushLog('已清空技能输出')
+  }
+
+  async function handleInvokeSkill(skill: RoleSkillInfo) {
+    if (!selectedRoleId || !selectedRole) {
+      setSkillError('请先选择一位角色。')
+      pushLog('未选择角色时在执行技能', 'warn')
+      return
+    }
+    const input = skillInputs[skill.id]?.trim()
+    if (skill.requires_user_input && !input) {
+      setSkillError('请先填写这个技能需要的内容。')
+      return
+    }
+
+    setSkillError(null)
+    setSkillLoading((prev) => ({ ...prev, [skill.id]: true }))
+    pushLog(`执行技能 -> ${selectedRole.name}: ${skill.name}`)
+
+    try {
+      const response = await fetch(`${API_BASE}/roles/${selectedRoleId}/skills/${skill.id}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          input_text: input,
+          history: conversationRef.current.slice(-8),
+          speak: false,
+        }),
+      })
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`)
+      }
+      const data = await response.json()
+      const replyText: string = data.text || ''
+      setSkillResults((prev) => {
+        const entry: SkillResult = {
+          id: createLogId(),
+          roleId: selectedRoleId,
+          roleName: selectedRole.name,
+          skillId: skill.id,
+          skillName: skill.name,
+          text: replyText,
+          timestamp: timeFormatter.format(new Date()),
+        }
+        return [entry, ...prev]
+      })
+      setSkillInputs((prev) => ({ ...prev, [skill.id]: skill.requires_user_input ? '' : prev[skill.id] }))
+      pushLog(`技能返回 -> ${skill.name}`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '未知错误'
+      setSkillError(`执行技能失败: ${message}`)
+      pushLog(`执行技能出错: ${message}`, 'error')
+    } finally {
+      setSkillLoading((prev) => ({ ...prev, [skill.id]: false }))
+    }
+  }
 
   return (
     <div className="app">
       <div className="app__shell">
         <header className="app__header">
-          <span className="app__badge">MVP</span>
-          <h1 className="app__title">tiny-sola \u5bf9\u8bdd\u9762\u677f</h1>
-          <p className="app__subtitle">{statusInfo.hint}</p>
+          <span className="app__badge">Role-play</span>
+          <h1 className="app__title">tiny-sola 角色聊天</h1>
+          <p className="app__subtitle">{selectedRole ? `${selectedRole.name} 正等你开发语音对话和技能交互` : '请选择一位角色开始聊天'}</p>
           <div className="health-banner" role="status" aria-live="polite">
             <div className="health-banner__summary">
               <span className={`health-banner__pill health-banner__pill--${healthTone}`}>
                 {healthLabel}
               </span>
               {healthTimestamp && (
-                <span className="health-banner__timestamp">\u6700\u8fd1\u68c0\u6d4b {healthTimestamp}</span>
+                <span className="health-banner__timestamp">最近检测 {healthTimestamp}</span>
               )}
               {healthError && (
                 <span className="health-banner__error">{healthError}</span>
@@ -473,148 +639,273 @@ export default function App() {
           </ol>
         </header>
 
-
         <main className="app__main">
-          <section className="card card--primary">
-            <div className="card__header">
-              <div className="card__title-group">
-                <h2 className="card__title">\u5b9e\u65f6\u5f55\u97f3</h2>
-                <p className="card__subtitle">{statusInfo.hint}</p>
-              </div>
-              <span className={`status-chip status-chip--${statusInfo.tone}`}>
-                {statusInfo.label}
-              </span>
-            </div>
-            <div className="recorder">
-              <button
-                type="button"
-                className={recordButtonClass}
-                onClick={isRecording ? stopRecording : startRecording}
-                aria-pressed={isRecording}
-                aria-busy={status === 'uploading'}
-                disabled={recordButtonDisabled}
-              >
-                <span className="record-btn__icon" aria-hidden="true" />
-                {recordButtonLabel}
-              </button>
-              <p className="recorder__hint">
-                {isRecording
-                  ? '\u5f55\u97f3\u8fdb\u884c\u4e2d, \u70b9\u51fb\u6309\u94ae\u7ed3\u675f\u5e76\u81ea\u52a8\u89e3\u6790\u3002\u53ef\u4ee5\u6309\u4e0b\u7a7a\u683c\u952e\u5feb\u901f\u7ed3\u675f.'
-                  : status === 'uploading'
-                    ? '\u6b63\u5728\u4e0a\u4f20\u5e76\u8fdb\u884c\u8bed\u97f3\u8bc6\u522b, \u8bf7\u7a0d\u5019\u3002'
-                    : '\u70b9\u51fb\u6309\u94ae\u6388\u6743\u9ea6\u514b\u98ce\u5e76\u5f00\u59cb\u5f55\u97f3, \u6216\u6309\u7a7a\u683c\u952e\u5feb\u901f\u5f00\u59cb.'}
-              </p>
-            </div>
-          </section>
+          <div className="layout">
+            <aside className="layout__sidebar">
+              <section className="card">
+                <div className="card__header">
+                  <div className="card__title-group">
+                    <h2 className="card__title">搜索角色</h2>
+                    <p className="card__subtitle">输入关键词找到喜爱的聊天对象</p>
+                  </div>
+                </div>
+                <input
+                  type="search"
+                  className="input"
+                  placeholder="搜索名字、背景或专长"
+                  value={roleSearch}
+                  onChange={handleRoleSearchChange}
+                />
+              </section>
 
-          <section className="card card--aside">
-            <div className="card__header">
-              <div className="card__title-group">
-                <h2 className="card__title">\u6700\u65b0\u8bc6\u522b\u6587\u672c</h2>
-                <p className="card__subtitle">\u6765\u81ea\u6b63\u524d\u4e00\u6b21\u8bed\u97f3\u8bc6\u522b\u7684\u7ed3\u679c\u3002</p>
-              </div>
-              <button
-                type="button"
-                className="ghost-btn"
-                onClick={handleClearTranscription}
-                disabled={!hasTranscription}
-              >
-                \u6e05\u7a7a
-              </button>
-            </div>
-            <div className="text-box transcript-box" role="status" aria-live="polite">
-              {hasTranscription ? (
-                <p className="text-box__content">{lastTranscription}</p>
-              ) : (
-                <p className="text-box__placeholder">\u7b49\u5f85\u8bed\u97f3\u8bc6\u522b\u4ea7\u751f\u7b2c\u4e00\u6761\u5185\u5bb9\u3002</p>
-              )}
-            </div>
-          </section>
+              <section className="card role-list-card">
+                <div className="card__header">
+                  <div className="card__title-group">
+                    <h2 className="card__title">角色列表</h2>
+                    <p className="card__subtitle">点击选择并立即开始对话</p>
+                  </div>
+                </div>
+                <ul className="role-list">
+                  {filteredRoles.length ? (
+                    filteredRoles.map((role) => {
+                      const isActive = role.id === selectedRoleId
+                      return (
+                        <li key={role.id} className={`role-list__item ${isActive ? 'is-active' : ''}`}>
+                          <button type="button" className="role-card" onClick={() => handleSelectRole(role.id)}>
+                            <div className="role-card__header">
+                              <span className="role-card__name">{role.name}</span>
+                              {role.tagline && <span className="role-card__tagline">{role.tagline}</span>}
+                            </div>
+                            {role.summary && <p className="role-card__summary">{role.summary}</p>}
+                            {role.knowledge_focus?.length ? (
+                              <ul className="role-card__focus">
+                                {role.knowledge_focus.map((topic) => (
+                                  <li key={topic}>{topic}</li>
+                                ))}
+                              </ul>
+                            ) : null}
+                          </button>
+                        </li>
+                      )
+                    })
+                  ) : (
+                    <li className="role-list__placeholder">未找到相关角色</li>
+                  )}
+                </ul>
+              </section>
 
-          <section className="card">
-            <div className="card__header">
-              <div className="card__title-group">
-                <h2 className="card__title">\u6700\u65b0\u56de\u590d</h2>
-                <p className="card__subtitle">\u770b\u770b\u5de6\u4fa7\u72b6\u6001, \u9000\u56de\u6216\u7ee7\u7eed\u4ea4\u4e92\u3002</p>
-              </div>
-              <div className="card__actions">
-                <button
-                  type="button"
-                  className={`ghost-btn ghost-btn--accent ${copyState === 'copied' ? 'is-success' : ''} ${copyState === 'failed' ? 'is-failed' : ''}`}
-                  onClick={handleCopyReply}
-                  disabled={!canCopy}
-                >
-                  {copyLabel}
-                </button>
-                <button
-                  type="button"
-                  className="ghost-btn"
-                  onClick={handleClearReply}
-                  disabled={!canCopy}
-                >
-                  \u6e05\u7a7a
-                </button>
-              </div>
-            </div>
-            <div className="text-box reply-box" role="status" aria-live="polite">
-              {lastReplyText ? (
-                <p className="text-box__content">{lastReplyText}</p>
-              ) : (
-                <p className="text-box__placeholder">\u7b49\u5f85\u540e\u7aef\u8fd4\u56de\u7b2c\u4e00\u6761\u5185\u5bb9\u3002</p>
+              {selectedRole && (
+                <section className="card role-detail-card">
+                  <div className="card__header">
+                    <div className="card__title-group">
+                      <h2 className="card__title">{selectedRole.name}</h2>
+                      {selectedRole.alias && <p className="card__subtitle">{selectedRole.alias}</p>}
+                    </div>
+                  </div>
+                  {selectedRole.background && <p className="role-detail__paragraph">{selectedRole.background}</p>}
+                  {selectedRole.style && (
+                    <p className="role-detail__paragraph role-detail__paragraph--muted">表达风格: {selectedRole.style}</p>
+                  )}
+                  {selectedRole.sample_questions?.length ? (
+                    <div className="role-detail__block">
+                      <h3 className="role-detail__heading">建议提问</h3>
+                      <ul className="bullet-list">
+                        {selectedRole.sample_questions.map((item) => (
+                          <li key={item}>{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                  <button type="button" className="ghost-btn" onClick={handleResetConversation} disabled={!hasConversation}>
+                    重置对话
+                  </button>
+                </section>
               )}
-            </div>
-          </section>
+            </aside>
 
-          <section className="card card--logs card--wide">
-            <div className="card__header">
-              <div className="card__title-group">
-                <h2 className="card__title">\u8c03\u7528\u65e5\u5fd7</h2>
-                <p className="card__subtitle">\u4f18\u5148\u67e5\u770b\u6700\u8fd1\u5de6\u8fb9\u4e09\u6761\u8bb0\u5f55\u3002</p>
-              </div>
-              <button
-                type="button"
-                className="ghost-btn"
-                onClick={handleClearLogs}
-                disabled={logs.length === 0}
-              >
-                \u6e05\u7a7a
-              </button>
+            <div className="layout__main">
+              <section className="card card--primary">
+                <div className="card__header">
+                  <div className="card__title-group">
+                    <h2 className="card__title">实时录音</h2>
+                    <p className="card__subtitle">{statusInfo.hint}</p>
+                  </div>
+                  <span className={`status-chip status-chip--${statusInfo.tone}`}>
+                    {statusInfo.label}
+                  </span>
+                </div>
+                <div className="recorder">
+                  <button
+                    type="button"
+                    className={recordButtonClass}
+                    onClick={isRecording ? stopRecording : startRecording}
+                    aria-pressed={isRecording}
+                    aria-busy={status === 'uploading'}
+                    disabled={recordButtonDisabled}
+                  >
+                    <span className="record-btn__icon" aria-hidden="true" />
+                    {recordButtonLabel}
+                  </button>
+                  <p className="recorder__hint">
+                    {!selectedRoleId
+                      ? '请先在左侧选择一位角色，然后点击开始录音。'
+                      : isRecording
+                        ? '录音进行中, 点击按钮结束并自动解析。可以按下空格键快捷结束.'
+                        : status === 'uploading'
+                          ? '正在解析语音, 请稍后。'
+                          : '点击按钮授权麦克风并开始录音, 或按下空格键。'}
+                  </p>
+                </div>
+              </section>
+
+              <section className="card conversation-card">
+                <div className="card__header">
+                  <div className="card__title-group">
+                    <h2 className="card__title">对话时间线</h2>
+                    <p className="card__subtitle">记录你与 {selectedRoleName} 的当前交互</p>
+                  </div>
+                  <div className="card__actions">
+                    <button type="button" className="ghost-btn" onClick={handleCopyReply} disabled={!canCopy}>
+                      {copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制最新回复'}
+                    </button>
+                    <button type="button" className="ghost-btn" onClick={handleResetConversation} disabled={!hasConversation}>
+                      清空
+                    </button>
+                  </div>
+                </div>
+                <ul className="conversation-list" aria-live="polite">
+                  {conversation.length ? (
+                    conversation.map((msg, index) => (
+                      <li key={`${msg.role}-${index}-${msg.content.slice(0, 8)}`} className={`conversation-item conversation-item--${msg.role}`}>
+                        <span className="conversation-item__role">{msg.role === 'user' ? '用户' : selectedRoleName}</span>
+                        <p className="conversation-item__text">{msg.content}</p>
+                      </li>
+                    ))
+                  ) : (
+                    <li className="conversation-list__placeholder">等待首次录音或查看技能输出。</li>
+                  )}
+                </ul>
+              </section>
+
+              <section className="card skills-card">
+                <div className="card__header">
+                  <div className="card__title-group">
+                    <h2 className="card__title">角色技能</h2>
+                    <p className="card__subtitle">在回复之外, 角色可以提供通过 LLM 构造的深度赋能</p>
+                  </div>
+                </div>
+                {skillError && <p className="form-error">{skillError}</p>}
+                <ul className="skill-list">
+                  {selectedRoleSkills.length ? (
+                    selectedRoleSkills.map((skill) => {
+                      const loading = skillLoading[skill.id]
+                      return (
+                        <li key={skill.id} className="skill-list__item">
+                          <div className="skill-list__header">
+                            <div>
+                              <h3 className="skill-list__name">{skill.name}</h3>
+                              <p className="skill-list__description">{skill.description}</p>
+                            </div>
+                            <button
+                              type="button"
+                              className="ghost-btn ghost-btn--accent"
+                              onClick={() => handleInvokeSkill(skill)}
+                              disabled={loading}
+                            >
+                              {loading ? '执行中...' : '即刻执行'}
+                            </button>
+                          </div>
+                          {skill.requires_user_input && (
+                            <textarea
+                              className="input input--textarea"
+                              value={skillInputs[skill.id] ?? ''}
+                              placeholder={skill.placeholder ?? '输入您想要解答的问题'}
+                              onChange={(event) => handleSkillInputChange(skill.id, event.target.value)}
+                            />
+                          )}
+                        </li>
+                      )
+                    })
+                  ) : (
+                    <li className="skill-list__placeholder">请选择角色后查看可用技能</li>
+                  )}
+                </ul>
+              </section>
+
+              <section className="card skill-result-card">
+                <div className="card__header">
+                  <div className="card__title-group">
+                    <h2 className="card__title">技能输出</h2>
+                    <p className="card__subtitle">保存 AI 角色为你提供的短文或项目</p>
+                  </div>
+                  <button type="button" className="ghost-btn" onClick={handleClearSkillResults} disabled={!hasSkillResults}>
+                    清空
+                  </button>
+                </div>
+                <ul className="skill-result-list" aria-live="polite">
+                  {skillResults.length ? (
+                    skillResults.map((item) => (
+                      <li key={item.id} className="skill-result">
+                        <div className="skill-result__meta">
+                          <span className="skill-result__skill">{item.skillName}</span>
+                          <span className="skill-result__timestamp">{item.timestamp}</span>
+                        </div>
+                        <p className="skill-result__text">{item.text}</p>
+                      </li>
+                    ))
+                  ) : (
+                    <li className="skill-result-list__placeholder">暂无数据, 尝试执行上方的技能按钮。</li>
+                  )}
+                </ul>
+              </section>
+
+              <section className="card card--logs">
+                <div className="card__header">
+                  <div className="card__title-group">
+                    <h2 className="card__title">调用日志</h2>
+                    <p className="card__subtitle">查看每次录音、技能执行的详细记录</p>
+                  </div>
+                  <button type="button" className="ghost-btn" onClick={handleClearLogs} disabled={logs.length === 0}>
+                    清空
+                  </button>
+                </div>
+                <ul className="log-list">
+                  {logs.length ? (
+                    logs.map((entry) => (
+                      <li key={entry.id} className={`log-item log-item--${entry.tone}`}>
+                        <span className="log-item__time">{entry.timestamp}</span>
+                        <span className="log-item__text">{entry.text}</span>
+                      </li>
+                    ))
+                  ) : (
+                    <li className="log-list__placeholder">暂无日志, 等待交互记录。</li>
+                  )}
+                </ul>
+              </section>
             </div>
-            <ul className="log-list">
-              {logs.length ? (
-                logs.map((entry) => (
-                  <li key={entry.id} className={`log-item log-item--${entry.tone}`}>
-                    <span className="log-item__time">{entry.timestamp}</span>
-                    <span className="log-item__text">{entry.text}</span>
-                  </li>
-                ))
-              ) : (
-                <li className="log-list__placeholder">\u6682\u65e0\u65e5\u5fd7, \u7b49\u5f85\u4ea4\u4e92\u3002</li>
-              )}
-            </ul>
-          </section>
+          </div>
         </main>
-      </div>
 
-      {(errorMsg || copyState === 'copied' || copyState === 'failed') && (
-        <div className="toast-stack">
-          {errorMsg && (
-            <div className="toast toast--error" role="alert">
-              {errorMsg}
-            </div>
-          )}
-          {copyState === 'copied' && !errorMsg && (
-            <div className="toast toast--success" role="status">
-              \u5df2\u590d\u5236\u5230\u526a\u5200\u677f
-            </div>
-          )}
-          {copyState === 'failed' && !errorMsg && (
-            <div className="toast toast--warn" role="alert">
-              \u590d\u5236\u5931\u8d25\uff0c\u53ef\u6309 \u201cCtrl+C\u201d \u624b\u52a8\u590d\u5236
-            </div>
-          )}
-        </div>
-      )}
+        {(errorMsg || copyState === 'copied' || copyState === 'failed') && (
+          <div className="toast-stack">
+            {errorMsg && (
+              <div className="toast toast--error" role="alert">
+                {errorMsg}
+              </div>
+            )}
+            {copyState === 'copied' && !errorMsg && (
+              <div className="toast toast--success" role="status">
+                已复制到剪切板
+              </div>
+            )}
+            {copyState === 'failed' && !errorMsg && (
+              <div className="toast toast--warn" role="alert">
+                复制失败, 可按 “Ctrl+C” 手动复制
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
